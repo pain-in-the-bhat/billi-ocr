@@ -1,5 +1,3 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-
 const ALLOWED_ORIGINS = [
   "https://bekku.xyz",
   "https://pain-in-the-bhat.github.io",
@@ -16,8 +14,6 @@ Rules:
 - Clean up item names - remove extra spaces, weird characters
 - If price has a currency symbol, strip it and return just the number
 - Prices should be numbers only, not strings
-- If you see "₹350" return 350
-- If you see "350.00" return 350
 - Do NOT include any text before or after the JSON array
 - Do NOT include markdown code fences
 - Return an empty array [] if no items are found
@@ -63,21 +59,72 @@ export async function POST(req) {
   }
 
   try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
     const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
     const mimeType = image.match(/^data:(image\/\w+);/)?.[1] || "image/jpeg";
 
-    const result = await model.generateContent([
-      { inlineData: { data: base64Data, mimeType } },
-      SYSTEM_PROMPT,
-    ]);
+    const geminiReq = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: SYSTEM_PROMPT },
+                { inlineData: { data: base64Data, mimeType } },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      }
+    );
 
-    const response = await result.response;
-    let text = response.text().trim();
+    if (!geminiReq.ok) {
+      const errBody = await geminiReq.json().catch(() => ({}));
+      console.error("Gemini API error:", geminiReq.status, JSON.stringify(errBody));
+      if (geminiReq.status === 429) {
+        return new Response(
+          JSON.stringify({ error: "Rate limit exceeded. Try again in a moment." }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": origin,
+            },
+          }
+        );
+      }
+      return new Response(
+        JSON.stringify({ error: "Gemini API error" }),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": origin,
+          },
+        }
+      );
+    }
 
-    // Strip markdown code fences if present
+    const geminiRes = await geminiReq.json();
+    let text = geminiRes.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      return new Response(
+        JSON.stringify({ error: "No response from Gemini" }),
+        {
+          status: 502,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": origin,
+          },
+        }
+      );
+    }
+
+    text = text.trim();
     text = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "").trim();
 
     let items;
@@ -86,18 +133,29 @@ export async function POST(req) {
     } catch {
       return new Response(
         JSON.stringify({ error: "Failed to parse OCR response", raw: text }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
+        {
+          status: 502,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": origin,
+          },
+        }
       );
     }
 
     if (!Array.isArray(items)) {
       return new Response(
         JSON.stringify({ error: "Invalid response format", raw: text }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
+        {
+          status: 502,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": origin,
+          },
+        }
       );
     }
 
-    // Validate and clean items
     const cleaned = items
       .filter((item) => item.name && item.price && typeof item.price === "number")
       .map((item) => ({
